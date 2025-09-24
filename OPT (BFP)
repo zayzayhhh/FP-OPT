@@ -1,0 +1,97 @@
+"""
+OPT projections using BFP (iradon).
+"""
+import os, re
+import numpy as np
+import imageio.v2 as imageio
+from skimage.transform import iradon
+import matplotlib.pyplot as plt
+
+# Input parameters
+folder_path = r"D:\Summer research project\week12\4_degree_OPT"
+file_ext    = ".tif"
+deg_step    = 4          # Angular step size
+x_col       = 100        # Selected x column
+crop_y      = None       # y range
+filter_name = "ramp"
+
+# Collect projection files
+pattern = re.compile(r".*_z(\d+)%s$" % re.escape(file_ext), re.I)
+files = [(int(m.group(1)), os.path.join(folder_path, f))
+         for f in os.listdir(folder_path)
+         if (m := pattern.match(f))]
+files.sort(key=lambda t: t[0])
+if not files:
+    raise RuntimeError("No projection files found")
+num_proj = len(files)
+angles   = np.arange(num_proj) * deg_step
+print(f"Found {num_proj} projections · angles 0–{angles[-1]}°")
+
+# Read the first frame to get dimensions
+img0 = imageio.imread(files[0][1])
+if img0.ndim == 3:
+    img0 = img0.mean(2)
+img_h, img_w = img0.shape
+if not (0 <= x_col < img_w):
+    raise ValueError(f"x_col must be within [0, {img_w-1}]")
+
+# Crop in y direction
+if crop_y is None:
+    y0, y1 = 0, img_h
+else:
+    y0, y1 = crop_y
+    y0 = max(0, min(img_h - 1, y0))
+    y1 = max(y0 + 1, min(img_h,     y1))
+roi_h = y1 - y0
+print(f"Reconstructing vertical slice x={x_col}  |  y range [{y0}:{y1}] (height={roi_h})")
+
+# Build sinogram
+sinogram = np.empty((roi_h, num_proj), np.float32)
+for i, (_, fname) in enumerate(files):
+    img = imageio.imread(fname)
+    if img.ndim == 3:
+        img = img.mean(2)
+    if img.shape[0] < y1:
+        raise ValueError(f"{fname} height={img.shape[0]} < y1={y1}")
+    sinogram[:, i] = img[y0:y1, x_col]
+
+# 2D ramp BPF reconstruction
+def recon_2d_ramp_bpf(sino: np.ndarray,
+                      angles_deg: np.ndarray,
+                      taper: float = 0.95):
+    # Unfiltered back projection
+    bp = iradon(sino, theta=angles_deg, filter_name=None, circle=False,
+                output_size=sino.shape[0])
+    # 2D FFT
+    G = np.fft.fft2(bp)
+    # Ramp weighting
+    H, W = bp.shape
+    ky = np.fft.fftfreq(H).reshape(-1, 1)
+    kz = np.fft.fftfreq(W).reshape(1,  -1)
+    r = np.sqrt(ky**2 + kz**2)
+    r[0, 0] = 0.0
+    ramp = (2 * np.pi) * r
+    # Optional taper window
+    if taper is not None:
+        r_norm = r / r.max()
+        t = np.clip((r_norm - taper) / max(1e-6, (1 - taper)), 0, 1)
+        window = 0.5 * (1 + np.cos(np.pi * t))
+        ramp = r * window
+    else:
+        ramp = r
+    # Filter and inverse FFT
+    Gf = G * ramp
+    recon = np.real(np.fft.ifft2(Gf))
+    return recon, bp
+
+# Run reconstruction
+recon, bp = recon_2d_ramp_bpf(sinogram, angles, taper=None)
+
+# Display result
+plt.imshow(recon, cmap="gray", extent=[-roi_h/2, roi_h/2, y1, y0])
+plt.title(f"Vertical reconstruction at x={x_col}")
+plt.xlabel("z (px)")
+plt.ylabel("y (px)")
+plt.gca().invert_yaxis()
+plt.axis("equal")
+plt.show()
