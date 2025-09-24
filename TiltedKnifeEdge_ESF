@@ -1,0 +1,108 @@
+#TiltedKnifeEdge_ESF
+
+import numpy as np
+import tifffile as tiff
+import matplotlib.pyplot as plt
+from scipy import ndimage
+import sys
+
+# ========= User-adjustable parameters =========
+img_path = r'D:\Summer research project\week12\MTF\NA3\4MM.tif'  # tilted knife-edge image
+already_have_roi = True                                          # set False on first run to preview ROI box
+roi = (183, 300, 300, 600)                                       # (x, y, w, h) — set after preview and then True
+edge_center = (100, 100)                                         # approximate edge center for preview
+preview_frac = 0.6                                               # reference box size vs. full image (0.3–0.8)
+angle = -6                                                       # measured tilt angle (deg); "/" is negative
+avg_cols = 5                                                     # horizontal column-average window (>=1) for denoising
+# ==============================================
+
+
+def show_original(img, box, title):
+    """Display image with a green rectangle for ROI preview/confirmation."""
+    x, y, w, h = box
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.imshow(img, cmap='gray')
+    rect = plt.Rectangle((x, y), w, h, linewidth=2, edgecolor='lime', facecolor='none')
+    ax.add_patch(rect)
+    ax.set_title(title)
+    ax.set_axis_off()
+    plt.show()
+
+
+def extract_esf(img, box, ang_deg, avg_cols=1):
+    """ROI → deskew/derotate → optional horizontal column-averaging → vertical ESF."""
+    x, y, w, h = box
+    crop = img[y:y + h, x:x + w]
+    rot = ndimage.rotate(crop, ang_deg, reshape=False, order=3)
+
+    # After rotation, average adjacent columns to reduce noise (horizontal smoothing)
+    if avg_cols > 1 and rot.shape[1] // avg_cols > 0:
+        rot = rot.reshape(rot.shape[0], -1, avg_cols).mean(axis=2)
+
+    # Mean over columns → 1-D ESF along vertical direction
+    esf = rot.mean(axis=1)
+    # Normalize to [0,1]
+    esf = (esf - esf.min()) / (esf.max() - esf.min())
+    return crop, rot, esf
+
+
+def main():
+    img = tiff.imread(img_path).astype(np.float32)
+    global roi
+
+    # -------- Step 0: create a suggested ROI if user hasn't set one --------
+    if not already_have_roi:
+        H, W = img.shape[:2]
+        bw, bh = int(W * preview_frac), int(H * preview_frac)
+        cx, cy = edge_center
+        x = max(0, cx - bw // 2)
+        y = max(0, cy - bh // 2)
+        roi = (x, y, bw, bh)
+        show_original(img, roi, 'Suggested ROI (green box)')
+        print(f'★ Suggested ROI = {roi}')
+        print('★ Copy this tuple into `roi`, set `already_have_roi=True`, then run again.')
+        sys.exit(0)
+
+    # -------- Step 1: confirm ROI --------
+    show_original(img, roi, 'Confirm ROI (green box)')
+    input('ROI OK? Close the window and press Enter to continue (or edit `roi` and rerun): ')
+
+    # -------- Step 2: rotate and extract vertical ESF --------
+    crop, rot, esf = extract_esf(img, roi, angle, avg_cols)
+
+    # Position axis in mm (6.45 µm pixel -> 6.45e-3 mm; divide by M if magnification != 1)
+    x_mm = np.arange(esf.size) * 6.45e-3
+
+    # -------- Step 3: quick preview (rotated ROI + ESF curve) --------
+    fig, axs = plt.subplots(1, 2, figsize=(11, 4))
+
+    # (a) rotated ROI with a reference vertical line
+    axs[0].imshow(rot, cmap='gray')
+    axs[0].set_title('Rotated ROI')
+    axs[0].axvline(rot.shape[1] // 2, color='r', lw=1)
+    axs[0].set_axis_off()
+
+    # (b) ESF curve vs. position (mm)
+    x_mm = np.arange(esf.size) * 6.45e-3
+    axs[1].plot(x_mm, esf, lw=1.5)
+    axs[1].set_title('Extracted ESF (vertical)')
+    axs[1].set_xlabel('Position (mm)')
+    axs[1].set_ylabel('Normalized intensity')
+    axs[1].grid(alpha=0.3)
+
+    # Save ESF with position in mm (use 6.45e-3 / M if magnification M != 1)
+    x_mm = np.arange(esf.size) * 6.45e-3
+    out_txt = f'{img_path.rsplit(".", 1)[0]}_esf_mm.txt'
+    np.savetxt(out_txt, np.column_stack([x_mm, esf]),
+               fmt='%.6f', header='pos_mm\tintensity_norm')
+
+    print(f'✔ ESF data saved to: {out_txt}')
+
+    plt.tight_layout()
+    plt.show()
+
+    print('✔ ESF extraction completed (vertical direction, angle corrected).')
+
+
+if __name__ == '__main__':
+    main()
