@@ -1,0 +1,188 @@
+#OPT(BFP) with MTF mask filter
+
+import os, re
+import numpy as np
+import imageio.v2 as imageio
+from skimage.transform import iradon
+import matplotlib.pyplot as plt
+
+# === Config: I/O, geometry, optional Z-aware gate, and filtering options ===
+folder_path = r"D:\Summer research project\week12\4_degree_OPT"
+file_ext    = ".tif"
+deg_step    = 4
+x_col       = 100
+crop_y      = None
+
+RAMPXMTF_NPY = r"D:\Summer research project\week12\MTF\NA1\rampXmtf_z_vs_kx.npy"
+AXIS_KX_CSV  = r"D:\Summer research project\week12\MTF\NA1\axis_kx_mm^-1.csv"
+AXIS_Z_CSV   = r"D:\Summer research project\week12\MTF\NA1\axis_z_mm.csv"
+
+dy_mm = 6.45e-3
+dz_mm = 6.45e-3
+
+TAPER_2D_RAMP = 0.95
+SAVE_FIG_PATH = os.path.join(os.path.dirname(folder_path), "compare_rampXMTF_vs_baseline.png")
+
+
+# === Utilities: load W(Z,kx) and resample to current (ky,z) grid ===
+def load_rampxmtf(mask_npy_path, axis_kx_csv, axis_z_csv):
+    """Load Z-aware gate W(Z,kx) and ensure ascending axes."""
+    W_z_kx  = np.load(mask_npy_path).astype(np.float32)
+    kx_axis = np.loadtxt(axis_kx_csv, delimiter=",", skiprows=1).astype(np.float64)
+    z_axis  = np.loadtxt(axis_z_csv,  delimiter=",", skiprows=1).astype(np.float64)
+    if np.any(np.diff(kx_axis) < 0):
+        idx = np.argsort(kx_axis);  kx_axis = kx_axis[idx];  W_z_kx = W_z_kx[:, idx]
+    if np.any(np.diff(z_axis) < 0):
+        idx = np.argsort(z_axis);   z_axis  = z_axis[idx];   W_z_kx = W_z_kx[idx, :]
+    return W_z_kx, kx_axis, z_axis
+
+
+def resample_W_to_current_grid(W_z_kx, kx_src, z_src, ky_mm_dst, z_mm_dst):
+    """Interpolate W(Z,kx) → W(ky,z): kx→ky per Z, then Z→z per ky."""
+    Nz_src, _ = W_z_kx.shape
+    H, W = ky_mm_dst.size, z_mm_dst.size
+    W_kx_to_ky = np.empty((Nz_src, H), dtype=np.float32)
+    for iz in range(Nz_src):
+        W_kx_to_ky[iz, :] = np.interp(ky_mm_dst, kx_src, W_z_kx[iz, :], left=0.0, right=0.0)
+    W_ky_z = np.empty((H, W), dtype=np.float32)
+    for ik in range(H):
+        W_ky_z[ik, :] = np.interp(z_mm_dst, z_src, W_kx_to_ky[:, ik],
+                                  left=W_kx_to_ky[0, ik], right=W_kx_to_ky[-1, ik])
+    return W_ky_z
+
+
+# === Core: BFP reconstruction → optional Z-gate → 2D ramp filtering ===
+def recon_2d_ramp_bpf(
+    sino: np.ndarray,
+    angles_deg: np.ndarray,
+    taper: float = 0.95,
+    rampxmtf_npy: str = None,
+    axis_kx_csv: str = None,
+    axis_z_csv:  str = None,
+    dy_mm: float = None,
+    dz_mm: float = None,
+):
+    """Back-project-then-filter pipeline with optional ramp×MTF Z-aware gating."""
+    bp = iradon(sino, theta=angles_deg, filter_name=None, circle=False, output_size=sino.shape[0])
+
+    if (rampxmtf_npy is not None) and (axis_kx_csv is not None) and (axis_z_csv is not None):
+        if (dy_mm is None) or (dz_mm is None):
+            raise ValueError("dy_mm and dz_mm are required when using ramp×MTF.")
+        H, W = bp.shape
+        ky_mm = np.fft.fftshift(np.fft.fftfreq(H, d=dy_mm))
+        z_mm  = (np.arange(W) - W//2) * dz_mm
+        W_z_kx, kx_axis, z_axis = load_rampxmtf(rampxmtf_npy, axis_kx_csv, axis_z_csv)
+        W_ky_z = resample_W_to_current_grid(W_z_kx, kx_axis, z_axis, ky_mm, z_mm)
+        Gy = np.fft.fft(bp, axis=0)
+        Gy = np.fft.fftshift(Gy, axes=0)
+        Gy *= W_ky_z.astype(Gy.dtype)
+        Gy = np.fft.ifftshift(Gy, axes=0)
+        bp = np.fft.ifft(Gy, axis=0).real
+
+    G = np.fft.fft2(bp)
+    H, W = bp.shape
+    ky = np.fft.fftfreq(H).reshape(-1, 1)
+    kz = np.fft.fftfreq(W).reshape(1,  -1)
+    r  = np.sqrt(ky**2 + kz**2);  r[0, 0] = 0.0
+    if taper is not None:
+        r_norm = r / (r.max() + 1e-12)
+        t = np.clip((r_norm - taper) / max(1e-6, 1 - taper), 0, 1)
+        window = 0.5 * (1 + np.cos(np.pi * t))
+        ramp2d = r * window
+    else:
+        ramp2d = r
+    recon = np.real(np.fft.ifft2(G * ramp2d))
+    return recon, bp
+
+
+# === Runner: discover files, build sinogram, reconstruct, compare, visualize ===
+def main():
+    pattern = re.compile(r".*_z(\d+)%s$" % re.escape(file_ext), re.I)
+    files = [(int(m.group(1)), os.path.join(folder_path, f))
+             for f in os.listdir(folder_path) if (m := pattern.match(f))]
+    files.sort(key=lambda t: t[0])
+    if not files:
+        raise RuntimeError("No projection files found")
+    num_proj = len(files)
+    angles   = np.arange(num_proj) * deg_step
+    print(f"Found {num_proj} projections · angles 0–{angles[-1]}°")
+
+    img0 = imageio.imread(files[0][1])
+    if img0.ndim == 3: img0 = img0.mean(2)
+    img_h, img_w = img0.shape
+    if not (0 <= x_col < img_w):
+        raise ValueError(f"x_col must be within [0, {img_w-1}]")
+    if crop_y is None:
+        y0, y1 = 0, img_h
+    else:
+        y0, y1 = crop_y
+        y0 = max(0, min(img_h - 1, y0))
+        y1 = max(y0 + 1, min(img_h,     y1))
+    roi_h = y1 - y0
+    print(f"Reconstructing slice at x={x_col} | y∈[{y0}:{y1}] (H={roi_h})")
+
+    sino = np.empty((roi_h, num_proj), np.float32)
+    for i, (_, fname) in enumerate(files):
+        img = imageio.imread(fname);  img = img.mean(2) if img.ndim == 3 else img
+        if img.shape[0] < y1: raise ValueError(f"{fname} height={img.shape[0]} < y1={y1}")
+        sino[:, i] = img[y0:y1, x_col]
+
+    recon_base, bp_base = recon_2d_ramp_bpf(sino, angles, taper=TAPER_2D_RAMP)
+    recon_gate, bp_gate = recon_2d_ramp_bpf(
+        sino, angles, taper=TAPER_2D_RAMP,
+        rampxmtf_npy=RAMPXMTF_NPY, axis_kx_csv=AXIS_KX_CSV, axis_z_csv=AXIS_Z_CSV,
+        dy_mm=dy_mm, dz_mm=dz_mm
+    )
+
+    from matplotlib.colors import TwoSlopeNorm, ListedColormap
+    def normalize_robust(img, p_low=1, p_high=99, eps=1e-9):
+        lo, hi = np.percentile(img, (p_low, p_high))
+        if hi <= lo:
+            lo, hi = float(img.min()), float(img.max())
+            if hi <= lo: return np.zeros_like(img, dtype=np.float32)
+        return np.clip((img - lo) / (hi - lo + eps), 0, 1).astype(np.float32)
+
+    base_n = normalize_robust(recon_base)
+    gate_n = normalize_robust(recon_gate)
+    diff   = base_n - gate_n
+    diff_abs = np.abs(diff)
+    v = max(float(np.percentile(diff_abs, 99.0)), 1e-8)
+    norm_div = TwoSlopeNorm(vcenter=0.0, vmin=-v, vmax=+v)
+
+    extent_mm = [-(roi_h / 2) * dz_mm, (roi_h / 2) * dz_mm, y1 * dy_mm, y0 * dy_mm]
+    H, W = diff.shape
+    z_vec = np.linspace(extent_mm[0], extent_mm[1], W)
+    y_vec = np.linspace(extent_mm[2], extent_mm[3], H)
+    Z, Y = np.meshgrid(z_vec, y_vec)
+
+    thr = float(np.percentile(diff_abs, 80.0))
+    sign_map = np.zeros_like(diff, dtype=np.int8)
+    sign_map[diff > +thr] = +1
+    sign_map[diff < -thr] = -1
+    cmap_sign = ListedColormap(["#3b4cc0", "#eeeeee", "#b40426"])
+
+    plt.figure(figsize=(16, 5))
+    plt.subplot(1, 4, 1)
+    plt.imshow(base_n, cmap="gray", extent=extent_mm, origin="upper", vmin=0, vmax=1, aspect="equal")
+    plt.title("Baseline (normalized)");  plt.xlabel("z (mm)");  plt.ylabel("y (mm)")
+
+    plt.subplot(1, 4, 2)
+    plt.imshow(gate_n, cmap="gray", extent=extent_mm, origin="upper", vmin=0, vmax=1, aspect="equal")
+    plt.title("With ramp×MTF (normalized)");  plt.xlabel("z (mm)");  plt.yticks([])
+
+    plt.subplot(1, 4, 3)
+    im = plt.imshow(diff, cmap="RdBu_r", norm=norm_div, extent=extent_mm, origin="upper", aspect="equal")
+    plt.contour(Z, Y, diff, levels=[0.0], colors="k", linewidths=0.7, alpha=0.9)
+    plt.title("Signed diff (FBP − gated)");  plt.xlabel("z (mm)");  plt.yticks([])
+    cb = plt.colorbar(im, fraction=0.046, pad=0.04);  cb.set_label("diff (normalized)")
+
+    plt.subplot(1, 4, 4)
+    plt.imshow(sign_map, cmap=cmap_sign, vmin=-1, vmax=+1, extent=extent_mm, origin="upper", aspect="equal")
+    plt.title("Sign only (>|diff| thresholded)");  plt.xlabel("z (mm)");  plt.yticks([])
+
+    plt.tight_layout()
+    plt.show()
+    # plt.savefig(SAVE_FIG_PATH, dpi=180)
+
+if __name__ == "__main__":
+    main()
