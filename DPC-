@@ -1,0 +1,344 @@
+#algorithm for DPC
+#refrence from:https://github.com/Waller-Lab/DPC
+
+#part1:main
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage import io
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from dpc_algorithm2 import DPCSolver
+
+# Load and stack all .tif images in a folder -> ndarray (N, H, W)
+def load_dpc_images(data_path):
+    files = [f for f in os.listdir(data_path) if f.endswith('.tif')]
+    files.sort()
+    imgs = [io.imread(os.path.join(data_path, f)) for f in files]
+    return np.array(imgs)
+
+# Dark/flat correction: (I - dark) / (illum - dark)
+def apply_dark_flat_correction(raw_imgs, dark_img, illum_img, eps=1e-8):
+    dark = dark_img.astype(np.float64)
+    illum = illum_img.astype(np.float64)
+    denom = illum - dark
+    denom[denom < eps] = eps  # avoid division by zero
+    corrected = (raw_imgs.astype(np.float64) - dark) / denom
+    return corrected
+
+# Quick look at the first four DPC images
+def visualize_dpc_images(dpc_images):
+    fig, axes = plt.subplots(2, 2, figsize=(6,6))
+    for idx in range(4):
+        r, c = divmod(idx, 2)
+        axes[r,c].imshow(dpc_images[idx], cmap='gray')
+        axes[r,c].axis('off')
+        axes[r,c].set_title(f"DPC {idx:02d}")
+    fig.tight_layout()
+    plt.show()
+
+def main():
+    # Paths
+    data_path = r"D:\Summer research project\Data_in_paper9-13\1\dpc\dpc_small_sample"
+    dark_path = r"D:\Summer research project\Data_in_paper9-13\DPC\dark.tif"
+    illum_path = r"D:\Summer research project\Data_in_paper9-13\DPC\bright.tif"
+
+    # Read images
+    dpc_images = load_dpc_images(data_path)
+    I_dark = io.imread(dark_path)
+    I_illum = io.imread(illum_path)
+
+    # Apply dark/flat correction
+    dpc_images = apply_dark_flat_correction(dpc_images, I_dark, I_illum)
+
+    # Optional visualization
+    visualize_dpc_images(dpc_images)
+
+    # System parameters (camera/objective/illumination)
+    wavelength     = 0.650          # wavelength in micrometers
+    mag            = 1              # magnification
+    na             = 0.0286         # objective NA
+    na_in          = 0.0            # source inner NA (0 for circular)
+    pixel_size_cam = 6.45           # camera pixel (um)
+    pixel_size     = pixel_size_cam / mag
+    rotation       = [270, 90, 0, 180]  # image rotations for R/L/T/B
+    dpc_num        = 4
+
+    # Initialize solver
+    solver = DPCSolver(
+        dpc_images, wavelength, na, na_in,
+        pixel_size, rotation, dpc_num=dpc_num
+    )
+
+    # Axes in normalized frequency units for plotting
+    fx = solver.fxlin.real * solver.wavelength / solver.na
+    fy = solver.fylin.real * solver.wavelength / solver.na
+    extent = [fx.min(), fx.max(), fy.min(), fy.max()]
+
+    # Plot source patterns
+    fig, axes = plt.subplots(2, 2, figsize=(6, 6))
+    for i, src in enumerate(solver.source):
+        r, c = divmod(i, 2)
+        img = np.fft.fftshift(src)
+        axes[r, c].imshow(img, cmap='gray', clim=(0, 1), extent=extent)
+        axes[r, c].axis('off')
+        axes[r, c].set_title(f"Source {i:02d}")
+        axes[r, c].set_aspect(1)
+        axes[r, c].set_xlim(-1.2, 1.2)
+        axes[r, c].set_ylim(-1.2, 1.2)
+    fig.tight_layout()
+    plt.show()
+
+    # Plot WOTF (absorption/phase channels)
+    fig, axes = plt.subplots(2, solver.dpc_num, figsize=(4 * solver.dpc_num, 4))
+    for row in range(2):
+        for col in range(solver.dpc_num):
+            ax = axes[row, col]
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size="5%", pad=0.05)
+
+            if row == 0:
+                data = np.fft.fftshift(solver.Hu[col].real)  # absorption
+                clim = [-2, 2]
+                title = f"Absorption WOTF {col:02d}"
+            else:
+                data = np.fft.fftshift(solver.Hp[col].imag)  # phase
+                clim = [-0.8, 0.8]
+                title = f"Phase WOTF {col:02d}"
+
+            im = ax.imshow(data, cmap='jet', extent=extent, clim=clim)
+            ax.axis('off')
+            ax.set_title(title)
+            plt.colorbar(im, cax=cax)
+            ax.set_aspect(1)
+            ax.set_xlim(-2.2, 2.2)
+            ax.set_ylim(-2.2, 2.2)
+
+    fig.tight_layout()
+    plt.show()
+
+    # Solve with simple Tikhonov regularization
+    solver.setTikhonovRegularization(reg_u=1e-1, reg_p=5e-2)
+    result = solver.solve()  # complex image: real=absorption, imag=phase
+
+    # Show one component (idx 0)
+    abs_img = result[0].real
+    phase_img = result[0].imag
+
+    fig, axes = plt.subplots(1, 2, figsize=(10,6))
+    im1 = axes[0].imshow(abs_img, cmap='gray', clim=[-0.15, 0.02])
+    axes[0].axis('off')
+    axes[0].set_title("Absorption")
+    plt.colorbar(im1, ax=axes[0])
+
+    im2 = axes[1].imshow(phase_img, cmap='gray', clim=[-1.0, 3.0])
+    axes[1].axis('off')
+    axes[1].set_title("Phase")
+    plt.colorbar(im2, ax=axes[1])
+
+    fig.tight_layout()
+    plt.show()
+
+    # Save raw float32 and 16-bit visualization
+    output_dir = r"D:\Summer research project\Data_in_paper9-13\1\dpc\dpc_small_sample_result"
+    vis_dir = os.path.join(output_dir, "visualization")
+    raw_dir = os.path.join(output_dir, "raw_float32")
+    os.makedirs(vis_dir, exist_ok=True)
+    os.makedirs(raw_dir, exist_ok=True)
+
+    for idx, comp in enumerate(result):
+        abs_img = comp.real
+        phase_img = comp.imag
+
+        # raw float32 for downstream processing
+        abs_raw_path = os.path.join(raw_dir, f"absorption_{idx:03d}.tif")
+        phase_raw_path = os.path.join(raw_dir, f"phase_{idx:03d}.tif")
+        io.imsave(abs_raw_path, abs_img.astype(np.float32))
+        io.imsave(phase_raw_path, phase_img.astype(np.float32))
+
+        # linear normalize to 16-bit for viewing
+        eps = 1e-8
+        a_min, a_max = abs_img.min(), abs_img.max()
+        p_min, p_max = phase_img.min(), phase_img.max()
+        abs_norm = np.clip((abs_img - a_min) / (a_max - a_min + eps), 0, 1)
+        phs_norm = np.clip((phase_img - p_min) / (p_max - p_min + eps), 0, 1)
+        abs_vis = (abs_norm * 65535).astype(np.uint16)
+        phs_vis = (phs_norm * 65535).astype(np.uint16)
+
+        abs_vis_path = os.path.join(vis_dir, f"absorption_{idx:03d}.tif")
+        phase_vis_path = os.path.join(vis_dir, f"phase_{idx:03d}.tif")
+        io.imsave(abs_vis_path, abs_vis)
+        io.imsave(phase_vis_path, phs_vis)
+
+        print(f"[RAW] {abs_raw_path} , {phase_raw_path}")
+        print(f"[VIS] {abs_vis_path} , {phase_vis_path}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+#part2:algorithm
+
+import numpy as np
+
+# handy aliases
+pi = np.pi
+naxis = np.newaxis
+F = lambda x: np.fft.fft2(x)         # 2D FFT
+IF = lambda x: np.fft.ifft2(x)       # 2D IFFT
+
+
+def pupilGen(fxlin, fylin, wavelength, na, na_in=0.0):
+    """
+    Generate a circular pupil (optionally annular if na_in > 0).
+    fxlin, fylin are spatial frequency axes (1/length).
+    """
+    # binary outer NA mask
+    pupil = np.array(fxlin[naxis, :] ** 2 + fylin[:, naxis] ** 2 <= (na / wavelength) ** 2)
+    # inner stop for annular source
+    if na_in != 0.0:
+        pupil[fxlin[naxis, :] ** 2 + fylin[:, naxis] ** 2 < (na_in / wavelength) ** 2] = 0.0
+    return pupil
+
+
+def _genGrid(size, dx):
+    """
+    Build a centered 1D coordinate grid with spacing dx.
+    Returned as complex to match later operations.
+    """
+    xlin = np.arange(size, dtype='complex128')
+    return (xlin - size // 2) * dx
+
+
+class DPCSolver:
+    """
+    Simple DPC (Differential Phase Contrast) solver using WOTF.
+    Inputs:
+      dpc_imgs: (N, H, W) stack; N must be multiple of dpc_num
+      wavelength: in same units as pixel_size
+      na, na_in: objective NA and inner NA for annular pupil (0 = filled)
+      pixel_size: object-space pixel size
+      rotation: list of 4 angles for R/L/T/B masks (deg)
+    """
+
+    def __init__(self, dpc_imgs, wavelength, na, na_in, pixel_size, rotation, dpc_num=4):
+        # basic parameters
+        self.wavelength = wavelength
+        self.na = na
+        self.na_in = na_in
+        self.pixel_size = pixel_size
+        self.dpc_num = 4
+        self.rotation = rotation
+
+        # frequency axes (ifftshift so DC at [0,0] after later fftshift visualizations)
+        self.fxlin = np.fft.ifftshift(
+            _genGrid(dpc_imgs.shape[-1], 1.0 / dpc_imgs.shape[-1] / self.pixel_size)
+        )
+        self.fylin = np.fft.ifftshift(
+            _genGrid(dpc_imgs.shape[-2], 1.0 / dpc_imgs.shape[-2] / self.pixel_size)
+        )
+
+        # copy and normalize raw DPC images
+        self.dpc_imgs = dpc_imgs.astype('float64')
+        self.normalization()
+
+        # pupil and source/WOTF precomputation
+        self.pupil = pupilGen(self.fxlin, self.fylin, self.wavelength, self.na)
+        self.sourceGen()
+        self.WOTFGen()
+
+    def setTikhonovRegularization(self, reg_u=1e-6, reg_p=1e-6):
+        """Set Tikhonov regularization for absorption (u) and phase (p)."""
+        self.reg_u = reg_u
+        self.reg_p = reg_p
+
+    def normalization(self):
+        """
+        Per-frame DC normalization: I <- I / mean(I) - 1.
+        Keeps images centered around zero; robust to global gain.
+        """
+        for img in self.dpc_imgs:
+            eps = 1e-8
+            meanIntensity = img.mean()
+            # guard against nan/inf/near-zero
+            meanIntensity = eps if (not np.isfinite(meanIntensity) or abs(meanIntensity) < eps) else meanIntensity
+            img /= meanIntensity
+            img -= 1.0
+
+    def sourceGen(self):
+        """
+        Build 4 half-circle source patterns (R/L/T/B) according to rotation angles.
+        Signed masks produce opposite-hemisphere pairs for differential response.
+        """
+        self.source = []
+        pupil = pupilGen(self.fxlin, self.fylin, self.wavelength, self.na, na_in=self.na_in)
+        for rotIdx in range(self.dpc_num):
+            self.source.append(np.zeros(self.dpc_imgs.shape[-2:]))
+            rotdegree = self.rotation[rotIdx]
+            # line boundary in frequency plane: fy*cos(theta) ? fx*sin(theta)
+            if rotdegree < 180:
+                self.source[-1][self.fylin[:, naxis] * np.cos(np.deg2rad(rotdegree)) + 1e-15 >=
+                                self.fxlin[naxis, :] * np.sin(np.deg2rad(rotdegree))] = 1.0
+                self.source[-1] *= pupil
+            else:
+                self.source[-1][self.fylin[:, naxis] * np.cos(np.deg2rad(rotdegree)) + 1e-15 <
+                                self.fxlin[naxis, :] * np.sin(np.deg2rad(rotdegree))] = -1.0
+                self.source[-1] *= pupil
+                self.source[-1] += pupil  # convert to complementary half
+        self.source = np.asarray(self.source)
+
+    def WOTFGen(self):
+        """
+        Compute weak-object transfer functions for absorption (Hu) and phase (Hp).
+        """
+        self.Hu = []
+        self.Hp = []
+        for rotIdx in range(self.source.shape[0]):
+            # pupil-weighted source → system OTF cross terms
+            FSP_cFP = F(self.source[rotIdx] * self.pupil) * F(self.pupil).conj()
+            I0 = (self.source[rotIdx] * self.pupil * self.pupil.conj()).sum()  # normalization power
+            self.Hu.append(2.0 * IF(FSP_cFP.real) / I0)              # absorption channel (even)
+            self.Hp.append(2.0j * IF(1j * FSP_cFP.imag) / I0)        # phase channel (odd)
+        self.Hu = np.asarray(self.Hu)
+        self.Hp = np.asarray(self.Hp)
+
+    def solve(self, xini=None, plot_verbose=False, **kwargs):
+        """
+        Solve least-squares in Fourier domain for each 4-frame group:
+          [u, p]^T = (A^H A)^(-1) A^H y
+        Returns: array of complex images (real=u, imag=p)
+        """
+        dpc_result = []
+
+        # Precompute normal equations blocks (2x2) in Fourier domain
+        AHA = [
+            (self.Hu.conj() * self.Hu).sum(axis=0) + self.reg_u,    # (0,0)
+            (self.Hu.conj() * self.Hp).sum(axis=0),                 # (0,1)
+            (self.Hp.conj() * self.Hu).sum(axis=0),                 # (1,0)
+            (self.Hp.conj() * self.Hp).sum(axis=0) + self.reg_p     # (1,1)
+        ]
+        determinant = AHA[0] * AHA[3] - AHA[1] * AHA[2]             # det(A^H A)
+
+        # Process frames in groups of dpc_num (R/L/T/B)
+        for frame_index in range(self.dpc_imgs.shape[0] // self.dpc_num):
+            # stack FFTs of the 4 directional images
+            fIntensity = np.asarray(
+                [F(self.dpc_imgs[frame_index * self.dpc_num + image_index]) for image_index in range(self.dpc_num)]
+            )
+            # A^H y terms for absorption and phase
+            AHy = np.asarray([
+                (self.Hu.conj() * fIntensity).sum(axis=0),
+                (self.Hp.conj() * fIntensity).sum(axis=0)
+            ])
+
+            # Closed-form 2x2 inverse times AHy
+            absorption = IF((AHA[3] * AHy[0] - AHA[1] * AHy[1]) / determinant).real
+            phase      = IF((AHA[0] * AHy[1] - AHA[2] * AHy[0]) / determinant).real
+
+            dpc_result.append(absorption + 1.0j * phase)
+
+        return np.asarray(dpc_result)
+
+
