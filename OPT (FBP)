@@ -1,0 +1,78 @@
+"""
+OPT projections using FBP (iradon).
+"""
+
+import os, re
+import numpy as np
+import imageio.v2 as imageio
+from skimage.transform import iradon
+import matplotlib.pyplot as plt
+
+# -------- Parameters --------
+folder_path = r"D:\Summer research project\week12\4_degree_OPT"  # folder with projection images
+file_ext    = ".tif"        # image file extension
+deg_step    = 4             # angular step between projections, in degrees
+x_col       = 100           # image column (x) to extract as the vertical slice
+crop_y      = None          # (y_min, y_max) to crop along y; None uses full height
+filter_name = "ramp"        # FBP filter name for iradon
+# ----------------------------
+
+# 1) Collect projection file paths and sort by z-index encoded in filename
+pattern = re.compile(r".*_z(\d+)%s$" % re.escape(file_ext), re.I)  # match ..._z###.tif (case-insensitive)
+files = [
+    (int(m.group(1)), os.path.join(folder_path, f))               # (index, fullpath)
+    for f in os.listdir(folder_path)
+    if (m := pattern.match(f))
+]
+files.sort(key=lambda t: t[0])                                     # sort by index
+if not files:
+    raise RuntimeError("No projection files found")
+num_proj = len(files)
+angles   = np.arange(num_proj) * deg_step                          # equally spaced angles
+print(f"Found {num_proj} projections · angles 0–{angles[-1]}°")
+
+# 2) Read first image to get dimensions and validate inputs
+img0 = imageio.imread(files[0][1])
+if img0.ndim == 3:
+    img0 = img0.mean(2)                                            # convert RGB to grayscale
+img_h, img_w = img0.shape
+if not (0 <= x_col < img_w):
+    raise ValueError(f"x_col must be within [0, {img_w-1}]")
+
+# Decide y-range (crop) safely
+if crop_y is None:
+    y0, y1 = 0, img_h                                              # full height
+else:
+    y0, y1 = crop_y
+    y0 = max(0, min(img_h - 1, y0))                                # clamp to valid range
+    y1 = max(y0 + 1, min(img_h,     y1))
+roi_h = y1 - y0
+print(f"Reconstructing vertical slice x={x_col}  |  y range [{y0}:{y1}] (height={roi_h})")
+
+# 3) Build the sinogram: each column is one projection’s vertical line at x=x_col
+sinogram = np.empty((roi_h, num_proj), np.float32)
+for i, (_, fname) in enumerate(files):
+    img = imageio.imread(fname)
+    if img.ndim == 3:
+        img = img.mean(2)                                          # grayscale
+    if img.shape[0] < y1:
+        raise ValueError(f"{fname} height={img.shape[0]} < y1={y1}")
+    sinogram[:, i] = img[y0:y1, x_col]                             # take vertical slice
+
+# 4) Filtered Backprojection (FBP) with scikit-image’s iradon
+recon = iradon(
+    sinogram,
+    theta       = angles,                                          # projection angles
+    filter_name = filter_name,                                     # e.g., "ramp"
+    circle      = True,                                            # assume circular support
+    output_size = roi_h                                            # make output square with height roi_h
+)
+
+# 5) Display result as a y–z slice (z along x-axis of the plot)
+plt.imshow(recon, cmap="gray", extent=[-roi_h/2, roi_h/2, y1, y0]) # extent maps axes to pixels
+plt.title(f"Vertical reconstruction at x={x_col}")
+plt.xlabel("z (px)")
+plt.ylabel("y (px)")
+plt.gca().invert_yaxis()                                           # image coordinates: top-left origin
+plt.axis("equal")
+plt.show()
