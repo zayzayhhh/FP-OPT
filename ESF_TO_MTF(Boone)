@@ -1,4 +1,4 @@
-#
+#It converts a tilted knife-edge ESF measured in real units (mm) into LSF and MTF robustly. By cropping around the edge, lightly smoothing, and fitting a Boone model (erf + exponential tail) to the ESF, it enables a clean analytic derivative (LSF) and rFFT to MTF—reducing noise sensitivity and giving results in cycles/mm for direct optical comparison.
 
 import os
 import numpy as np
